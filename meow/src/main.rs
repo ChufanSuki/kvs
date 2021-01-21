@@ -1,6 +1,16 @@
 use clap::{App, load_yaml};
+use dotenv_codegen::dotenv;
+use std::env;
 
 fn main() {
+    
+    println!("{}", dotenv!("PORT"));
+    let key = "HOME";
+    match env::var_os(key) {
+        Some(val) => println!("{}: {:?}", key, val),
+        None => println!("{} is not defined in the environment.", key)
+    }
+
     // The YAML file is found relative to the current file, similar to how modules are found
     let yaml = load_yaml!("cli.yml");
     let matches = App::from(yaml).get_matches();
