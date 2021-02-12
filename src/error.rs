@@ -1,4 +1,3 @@
-use crate::KvStore;
 use failure::Fail;
 use std::io;
 /// Error type for kvs.
@@ -31,5 +30,5 @@ impl From<serde_json::Error> for KvsError {
     }
 }
 
-/// Result type for kvs.
+/// Alias for a `Result` with the error  type `KvsError` for kvs.
 pub type Result<T> = std::result::Result<T, KvsError>;
