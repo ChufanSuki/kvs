@@ -1,22 +1,19 @@
 //!  defines logging
-use crate::Result;
+use crate::{KvsError, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use serde_json::Deserializer;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::prelude::*;
 use std::io::{self, BufReader, BufWriter, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-#[derive(Serialize, Deserialize, Debug)]
-pub enum Command {
-    Set { key: String, value: String },
-    Remove { key: String },
-}
+const COMPACTION_THRESHOLD: u64 = 1024 * 1024;
 /// Key-value Store
 pub struct KvStore {
     path: PathBuf,
-    readers: BTreeMap<u64, BufReaderWithPos<File>>,
+    readers: HashMap<u64, BufReaderWithPos<File>>,
     writer: BufWriterWithPos<File>,
     current_gen: u64,
     index: BTreeMap<String, CommandPos>,
@@ -81,6 +78,7 @@ impl<W: Write + Seek> Seek for BufWriterWithPos<W> {
         Ok(self.pos)
     }
 }
+
 fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
     let mut gen_list: Vec<u64> = fs::read_dir(&path)?
         .flat_map(|res| -> Result<_> { Ok(res?.path()) })
@@ -95,6 +93,22 @@ fn sorted_gen_list(path: &Path) -> Result<Vec<u64>> {
         .collect();
     gen_list.sort_unstable();
     Ok(gen_list)
+}
+/// Struct representing a command.
+#[derive(Serialize, Deserialize, Debug)]
+enum Command {
+    Set { key: String, value: String },
+    Remove { key: String },
+}
+
+impl Command {
+    fn set(key: String, value: String) -> Command {
+        Command::Set { key, value }
+    }
+
+    fn remove(key: String) -> Command {
+        Command::Remove { key }
+    }
 }
 /// Represents the position and length of a json-serialized command in the log.
 struct CommandPos {
@@ -112,13 +126,61 @@ impl From<(u64, Range<u64>)> for CommandPos {
         }
     }
 }
+fn log_path(dir: &Path, gen: u64) -> PathBuf {
+    dir.join(format!("{}.log", gen))
+}
+fn load(
+    gen: u64,
+    reader: &mut BufReaderWithPos<File>,
+    index: &mut BTreeMap<String, CommandPos>,
+) -> Result<u64> {
+    let mut pos = reader.seek(SeekFrom::Start(0))?;
+    let mut stream = Deserializer::from_reader(reader).into_iter::<Command>();
+    let mut uncompacted = 0;
+    while let Some(cmd) = stream.next() {
+        let new_pos = stream.byte_offset() as u64;
+        match cmd? {
+            Command::Set { key, .. } => {
+                if let Some(old_cmd) = index.insert(key, (gen, pos..new_pos).into()) {
+                    uncompacted += old_cmd.len;
+                }
+            }
+            Command::Remove { key } => {
+                if let Some(old_cmd) = index.remove(&key) {
+                    uncompacted += old_cmd.len;
+                }
+                // the "remove" command itself can be deleted in the next compaction.
+                // so we add its length to `uncompacted`.
+                uncompacted += new_pos - pos;
+            }
+        }
+        pos = new_pos;
+    }
+    Ok(uncompacted)
+}
+fn new_log_file(
+    path: &Path,
+    gen: u64,
+    readers: &mut HashMap<u64, BufReaderWithPos<File>>,
+) -> Result<BufWriterWithPos<File>> {
+    let path = log_path(&path, gen);
+    let writer = BufWriterWithPos::new(
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&path)?,
+    )?;
+    readers.insert(gen, BufReaderWithPos::new(File::open(&path)?)?);
+    Ok(writer)
+}
 impl KvStore {
     /// Open active file given path.
     pub fn open<T: Into<PathBuf>>(path: T) -> Result<Self> {
         let path = path.into();
         fs::create_dir_all(&path)?;
-        let mut readers = BTreeMap::new();
-        let mut writer = BTreeMap::new();
+        let mut readers = HashMap::new();
+        let mut index = BTreeMap::new();
         let gen_list = sorted_gen_list(&path)?;
         let mut uncompacted = 0;
         for &gen in &gen_list {
@@ -139,14 +201,60 @@ impl KvStore {
     }
     ///  Set the value of a string key to a string. Return an error if the value is not written successfully.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        let cmd = Command::set(key, value);
+        let pos = self.writer.pos;
+        serde_json::to_writer(&mut self.writer, &cmd)?;
+        self.writer.flush()?;
+        if let Command::Set { key, .. } = cmd {
+            if let Some(old_cmd) = self
+                .index
+                .insert(key, (self.current_gen, pos..self.writer.pos).into())
+            {
+                self.uncompacted += old_cmd.len;
+            }
+        }
+
+        if self.uncompacted > COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
         Ok(())
     }
+
     ///  Remove a given key. Return an error if the key does not exist or is not removed successfully.
     pub fn remove(&mut self, key: String) -> Result<()> {
-        Ok(())
+        if self.index.contains_key(&key) {
+            let cmd = Command::remove(key);
+            serde_json::to_writer(&mut self.writer, &cmd)?;
+            self.writer.flush()?;
+            if let Command::Remove { key } = cmd {
+                let old_cmd = self.index.remove(&key).expect("key not found");
+                self.uncompacted += old_cmd.len;
+            }
+            Ok(())
+        } else {
+            Err(KvsError::KeyNotFound)
+        }
     }
     /// Get the string value of a string key. If the key does not exist, return None. Return an error if the value is not read successfully.
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        Ok(None)
+        if let Some(cmd_pos) = self.index.get(&key) {
+            let reader = self
+                .readers
+                .get_mut(&cmd_pos.gen)
+                .expect("Cannot find log reader");
+            reader.seek(SeekFrom::Start(cmd_pos.pos))?;
+            let cmd_reader = reader.take(cmd_pos.len);
+            if let Command::Set { value, .. } = serde_json::from_reader(cmd_reader)? {
+                Ok(Some(value))
+            } else {
+                Err(KvsError::UnexpectedCommandType)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+    /// Compact
+    pub fn compact(&mut self) -> Result<()> {
+        unimplemented!()
     }
 }
